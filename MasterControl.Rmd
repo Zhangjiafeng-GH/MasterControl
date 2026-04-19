@@ -1,0 +1,494 @@
+---
+title: "MasterControl Performance — Exploratory Data Analysis"
+author: "Jeffrey"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+# 1. Load required libraries
+```{r}
+# Load the package
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(tidymodels)
+library(vip)
+library(corrplot)
+library(DALEXtra)
+library(finetune)  # For better tuning strategies
+
+# Set seed ins
+set.seed(123)
+```
+
+
+# 2. Import and initial data preparation
+
+```{r}
+qal_raw <- read_csv("Mastercontrol QAL Performance.csv")
+
+qal <- qal_raw |>
+  clean_names()
+
+glimpse(qal)
+```
+
+# 3. Target construction
+
+```{r}
+qal <- qal |>
+  mutate(
+    progressed = case_when(
+      next_stage_c %in% c("SQL", "SQO", "Won") ~ 1,
+      next_stage_c %in% c("Recycled", "Lost", "MQL", "INQ") ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+qal_model <- qal |>
+  filter(!next_stage_c %in% c("Exclude")) |>
+  filter(!is.na(progressed)) |>
+  mutate(
+    progressed = factor(progressed, levels = c(0, 1), labels = c("no", "yes"))
+  )
+
+qal_model |>
+  count(progressed) |>
+  mutate(pct = n / sum(n))
+```
+# 4. Feature engineering
+
+```{r}
+qal_model <- qal_model |>
+  mutate(
+    title_lower = tolower(contact_lead_title),
+    seniority = case_when(
+      str_detect(title_lower, "chief|ceo|cfo|coo|cio|cto") ~ "C-Level",
+      str_detect(title_lower, "vp|vice") ~ "VP",
+      str_detect(title_lower, "director") ~ "Director",
+      str_detect(title_lower, "manager") ~ "Manager",
+      is.na(title_lower) ~ "Missing",
+      TRUE ~ "Other"
+    ),
+    has_quality = str_detect(title_lower, "quality"),
+    has_ops     = str_detect(title_lower, "operat|manufactur|engineer"),
+    has_reg     = str_detect(title_lower, "regulat")
+  )
+```
+
+# 5. Train/Test Split
+```{r}
+
+qal_split <- initial_split(qal_model, prop = 0.8, strata = progressed)
+
+qal_train <- training(qal_split)
+qal_test <- testing(qal_split)
+
+# Cross-validation folds (5-fold, stratified)
+set.seed(123)
+qal_folds <- vfold_cv(qal_train, v = 5, strata = progressed)
+```
+
+
+# 6. Enhanced recipe with better preprocessing
+
+```{r}
+qal_recipe <- recipe(progressed ~ 
+                      # Account attributes
+                      acct_primary_site_function +
+                      acct_manufacturing_model +
+                      acct_target_industry +
+                      acct_territory_rollup +
+                      acct_tier_rollup +
+                      
+                      # Contact attributes
+                      seniority +
+                      has_quality +
+                      has_ops +
+                      has_reg +
+                      
+                      # Additional enhanced features
+                  
+                      last_tactic_campaign_channel,
+                    data = qal_train) %>%
+  
+  # Handle missing values with indicators
+  step_indicate_na(all_nominal_predictors()) %>%
+  
+  # Convert logicals to factors
+  step_mutate(
+    has_quality = factor(has_quality, levels = c(FALSE, TRUE)),
+    has_ops = factor(has_ops, levels = c(FALSE, TRUE)),
+    has_reg = factor(has_reg, levels = c(FALSE, TRUE))
+  ) %>%
+  
+  # Handle unseen levels
+  step_novel(all_nominal_predictors(), -all_outcomes()) %>%
+  
+  # Replace NA with "unknown"
+  step_unknown(all_nominal_predictors(), -all_outcomes()) %>%
+  
+  # Collapse rare categories
+  step_other(all_nominal_predictors(), -all_outcomes(), threshold = 0.05) %>%
+  
+  # Create dummy variables
+  step_dummy(all_nominal_predictors(), -all_outcomes()) %>%
+  
+  # Remove zero variance predictors
+  step_zv(all_predictors()) %>%
+  
+  # Impute remaining NAs in numeric columns
+  step_impute_median(all_numeric_predictors()) %>%
+  
+  # Normalize numeric predictors for models that benefit
+  step_normalize(all_numeric_predictors())
+
+# Check the recipe
+qal_recipe
+```
+# 7. Model specifications
+
+```{r}
+# 7.1 Logistic Regression 
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+# 7.2 LASSO (with tuning)
+lasso_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 1
+) %>%
+  set_engine("glmnet")
+
+# 7.3 Decision Tree
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# 7.4 Random Forest
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = 100,
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("classification")
+
+# 7.5 Gradient Boosting (XGBoost)
+xgb_spec <- boost_tree(
+  mtry = tune(),
+  trees = 100,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+# 8. Workflow 
+```{r}
+glm_wf <- workflow() %>% add_recipe(qal_recipe) %>% add_model(glm_spec)
+lasso_wf <- workflow() %>% add_recipe(qal_recipe) %>% add_model(lasso_spec)
+tree_wf <- workflow() %>% add_recipe(qal_recipe) %>% add_model(tree_spec)
+rf_wf <- workflow() %>% add_recipe(qal_recipe) %>% add_model(rf_spec)
+xgb_wf <- workflow() %>% add_recipe(qal_recipe) %>% add_model(xgb_spec)
+```
+
+# 9. Hyperparameter grids
+```{r}
+# LASSO grid
+lasso_grid <- grid_regular(
+  penalty(range = c(-4, -0.5)),
+  levels = 15
+)
+
+# Tree grid
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(range = c(3, 10)),
+  min_n(),
+  levels = 4
+)
+
+# Get number of predictors for mtry range
+prepped_recipe <- prep(qal_recipe, training = qal_train)
+n_pred <- ncol(juice(prepped_recipe)) - 1  # subtract outcome column
+
+# Random Forest grid
+rf_grid <- grid_regular(
+  mtry(range = c(2, min(20, n_pred))),
+  min_n(range = c(2, 20)),
+  levels = 5
+)
+
+# XGBoost grid
+set.seed(123)
+xgb_grid <- grid_latin_hypercube(
+  mtry(range = c(2, min(20, n_pred))),
+  tree_depth(range = c(2, 8)),
+  learn_rate(range = c(-3, -0.5)),
+  loss_reduction(range = c(-5, 1)),
+  min_n(range = c(2, 20)),
+  sample_size = sample_prop(range = c(0.5, 1)),
+  size = 20
+)
+
+```
+
+# 10. Model tuning
+```{r}
+# Define metrics
+metrics <- metric_set(roc_auc, pr_auc, accuracy, sens, spec)
+
+# Control for tuning
+ctrl <- control_grid(
+  save_pred = TRUE,
+  verbose = TRUE,
+  allow_par = TRUE,
+  parallel_over = "everything"
+)
+
+# Fit baseline GLM
+glm_res <- glm_wf %>%
+  fit_resamples(
+    resamples = qal_folds,
+    metrics = metrics,
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  )
+
+# Tune LASSO
+set.seed(123)
+lasso_res <- lasso_wf %>%
+  tune_grid(
+    resamples = qal_folds,
+    grid = lasso_grid,
+    metrics = metrics,
+    control = ctrl
+  )
+
+# Tune Decision Tree
+set.seed(123)
+tree_res <- tree_wf %>%
+  tune_grid(
+    resamples = qal_folds,
+    grid = tree_grid,
+    metrics = metrics,
+    control = ctrl
+  )
+
+# Tune Random Forest
+set.seed(123)
+rf_res <- rf_wf %>%
+  tune_grid(
+    resamples = qal_folds,
+    grid = rf_grid,
+    metrics = metrics,
+    control = ctrl
+  )
+
+# Tune XGBoost 
+set.seed(123)
+xgb_res <- xgb_wf %>%
+  tune_grid(
+    resamples = qal_folds,
+    grid = xgb_grid,
+    metrics = metrics,
+    control = ctrl
+  )
+
+```
+# 11. Model comparison
+```{r}
+# Collect results
+glm_metrics <- collect_metrics(glm_res) %>% mutate(model = "GLM")
+lasso_metrics <- collect_metrics(lasso_res) %>% mutate(model = "LASSO")
+tree_metrics <- collect_metrics(tree_res) %>% mutate(model = "Decision Tree")
+rf_metrics <- collect_metrics(rf_res) %>% mutate(model = "Random Forest")
+xgb_metrics <- collect_metrics(xgb_res) %>% mutate(model = "XGBoost")
+
+# Combine metrics
+all_metrics <- bind_rows(
+  glm_metrics,
+  lasso_metrics %>% filter(.metric %in% c("roc_auc", "pr_auc", "accuracy")),
+  tree_metrics %>% filter(.metric %in% c("roc_auc", "pr_auc", "accuracy")),
+  rf_metrics %>% filter(.metric %in% c("roc_auc", "pr_auc", "accuracy")),
+  xgb_metrics %>% filter(.metric %in% c("roc_auc", "pr_auc", "accuracy"))
+)
+
+# Best models by AUC
+best_models <- all_metrics %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+print("Model Comparison (ROC AUC):")
+print(best_models)
+```
+# 12. Select best model and finalize
+
+```{r}
+# Select best model based on ROC AUC
+best_model_name <- best_models$model[1]
+best_model_res <- switch(best_model_name,
+                         "LASSO" = lasso_res,
+                         "GLM" = glm_res,
+                         "Decision Tree" = tree_res,
+                         "Random Forest" = rf_res,
+                         "XGBoost" = xgb_res)
+
+# Get best hyperparameters
+if(best_model_name != "GLM") {
+  best_params <- select_best(best_model_res, metric = "roc_auc")
+  final_wf <- finalize_workflow(
+    switch(best_model_name,
+           "LASSO" = lasso_wf,
+           "Decision Tree" = tree_wf,
+           "Random Forest" = rf_wf,
+           "XGBoost" = xgb_wf),
+    best_params
+  )
+} else {
+  final_wf <- glm_wf
+}
+
+# Final fit on test data
+final_fit <- last_fit(final_wf, qal_split, metrics = metrics)
+
+# Test performance
+test_performance <- collect_metrics(final_fit)
+print("Final Model Performance on Test Set:")
+print(test_performance)
+
+```
+
+# 13. Feature importance for best model
+```{r}
+final_model <- extract_workflow(final_fit)
+
+if(best_model_name %in% c("LASSO", "GLM")) {
+  # For linear models, extract coefficients
+  if(best_model_name == "LASSO" && exists("best_params")) {
+    library(glmnet)
+    
+    coefs <- extract_fit_parsnip(final_model)$fit %>%
+      coef(s = best_params$penalty) %>%
+      as.matrix() %>%
+      as.data.frame() %>%
+      rownames_to_column("feature") %>%
+      rename(coefficient = s1) %>%
+      filter(coefficient != 0) %>%
+      arrange(desc(abs(coefficient)))
+    
+    print("Top 10 LASSO Coefficients (Non-zero):")
+    print(head(coefs, 10))
+  } else if(best_model_name == "GLM") {
+    coefs <- extract_fit_parsnip(final_model)$fit %>%
+      summary() %>%
+      coefficients() %>%
+      as.data.frame() %>%
+      rownames_to_column("feature") %>%
+      filter(`Pr(>|z|)` < 0.05) %>%  # Only significant at p < 0.05
+      arrange(desc(abs(Estimate))) %>%
+      head(10)
+    
+    print("Top 10 Significant GLM Coefficients:")
+    print(coefs)
+  }
+  
+} else if(best_model_name %in% c("Random Forest", "XGBoost")) {
+  importance <- final_model %>%
+    extract_fit_parsnip() %>%
+    vip::vi() %>%
+    arrange(desc(Importance))
+  
+  print("Top 10 Feature Importance:")
+  print(head(importance, 10))
+}
+```
+# 14. Model diagnostics
+
+```{r}
+# Predictions on test set
+test_preds <- collect_predictions(final_fit)
+
+# ROC Curve
+roc_curve <- test_preds %>%
+  roc_curve(truth = progressed, .pred_yes) %>%
+  autoplot() +
+  labs(
+    title = paste("ROC Curve -", best_model_name),
+    subtitle = paste("AUC =", round(test_performance %>% 
+                                      filter(.metric == "roc_auc") %>% 
+                                      pull(.estimate), 3))
+  )
+
+print(roc_curve)
+
+# Confusion Matrix
+conf_mat <- test_preds %>%
+  conf_mat(truth = progressed, estimate = .pred_class)
+
+print("Confusion Matrix:")
+print(conf_mat)
+```
+# 15. Business insights
+```{r}
+# Progression by seniority
+seniority_analysis <- qal_test %>%
+  bind_cols(
+    predict(extract_workflow(final_fit), new_data = ., type = "prob") %>%
+      rename(pred_prob_yes = .pred_yes)
+  ) %>%
+  group_by(seniority) %>%
+  summarise(
+    n = n(),
+    actual_rate = mean(progressed == "yes"),
+    predicted_rate = mean(pred_prob_yes),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(actual_rate))
+
+print("Progression by Seniority Level:")
+print(seniority_analysis)
+
+# Impact of functional indicators
+functional_impact <- qal_test %>%
+  bind_cols(
+    predict(extract_workflow(final_fit), new_data = ., type = "prob") %>%
+      rename(pred_prob_yes = .pred_yes)
+  ) %>%
+  summarise(
+    quality_yes = mean(pred_prob_yes[has_quality == TRUE], na.rm = TRUE),
+    quality_no = mean(pred_prob_yes[has_quality == FALSE], na.rm = TRUE),
+    quality_impact = mean(pred_prob_yes[has_quality == TRUE], na.rm = TRUE) - 
+                     mean(pred_prob_yes[has_quality == FALSE], na.rm = TRUE),
+    
+    ops_yes = mean(pred_prob_yes[has_ops == TRUE], na.rm = TRUE),
+    ops_no = mean(pred_prob_yes[has_ops == FALSE], na.rm = TRUE),
+    ops_impact = mean(pred_prob_yes[has_ops == TRUE], na.rm = TRUE) - 
+                 mean(pred_prob_yes[has_ops == FALSE], na.rm = TRUE),
+    
+    reg_yes = mean(pred_prob_yes[has_reg == TRUE], na.rm = TRUE),
+    reg_no = mean(pred_prob_yes[has_reg == FALSE], na.rm = TRUE),
+    reg_impact = mean(pred_prob_yes[has_reg == TRUE], na.rm = TRUE) - 
+                 mean(pred_prob_yes[has_reg == FALSE], na.rm = TRUE)
+  )
+
+print("Impact of Functional Indicators on Progression:")
+print(functional_impact %>% select(contains("impact")))
+```
+
+
+
+
+
